@@ -16,7 +16,7 @@ from .ebay_taxonomy import (
     get_category_suggestions,
     get_item_aspects_for_category,
 )
-from .ebay_comps import search_active_listings
+from .ebay_comps import search_active_listings, normalize_active_comps
 
 app = FastAPI(title="Reseller AI Backend", version="0.1.0")
 
@@ -93,7 +93,83 @@ def update_item(item_id: str, payload: ItemUpdate, _: None = Depends(require_api
 @app.post("/ebay/active_comps")
 async def active_comps(req: CompsRequest, _: None = Depends(require_api_key)):
     raw = await search_active_listings(req.query, req.limit)
-    return {"raw": raw}
+
+    # Normalize comps to include item price, shipping, and delivered totals
+    comps = normalize_active_comps(raw)
+
+    # Median shipping (used to impute delivered totals when shipping isn't shown)
+    ships = sorted([c["shipping"] for c in comps if c["shipping"] is not None])
+    ship_median = ships[len(ships) // 2] if ships else 0.0
+
+    # Delivered totals: prefer explicit delivered_total; otherwise price + median shipping
+    totals = []
+    for c in comps:
+        if c["delivered_total"] is not None:
+            totals.append(c["delivered_total"])
+        elif c["price"] is not None and ship_median > 0:
+            totals.append(c["price"] + ship_median)
+
+    totals = sorted(totals)
+
+    def _pct(vals, p):
+        if not vals:
+            return None
+        idx = int(round((p / 100) * (len(vals) - 1)))
+        idx = max(0, min(len(vals) - 1, idx))
+        return vals[idx]
+
+    fast_total = _pct(totals, 25)
+    typ_total  = _pct(totals, 50)
+    prem_total = _pct(totals, 85)
+
+    # Round rule:
+    # - under $3 → .49
+    # - $3 and up → .99
+    def _item_price(delivered):
+        import math
+        if delivered is None:
+            return None
+
+        v = delivered - ship_median
+
+        # hard minimum
+        if v < 0.99:
+            return 0.99
+
+        base = math.floor(v)
+        if v < 3:
+            return round(base + 0.49, 2)
+        return round(base + 0.99, 2)
+
+    def _est_delivered(delivered):
+        if delivered is None:
+            return None
+        ip = _item_price(delivered)
+        if ip is None:
+            return None
+        return round(ip + ship_median, 2)
+
+    pricing = {
+        "shipping_median": round(ship_median, 2),
+        "fast": {
+            "item_price": _item_price(fast_total),
+            "est_delivered": _est_delivered(fast_total),
+        },
+        "typical": {
+            "item_price": _item_price(typ_total),
+            "est_delivered": _est_delivered(typ_total),
+        },
+        "premium": {
+            "item_price": _item_price(prem_total),
+            "est_delivered": _est_delivered(prem_total),
+        },
+    }
+
+    return {
+        "raw": raw,
+        "normalized_comps": comps,
+        "pricing": pricing,
+    }
 
 
 @app.get("/ebay/default_category_tree")
